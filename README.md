@@ -11,6 +11,7 @@ A local Docker/Gradio interface for Krea-2 RAW and Turbo image generation using 
 - Recommended presets for Turbo and RAW
 - Model download helper for `turbo.safetensors` and `raw.safetensors`
 - Output history and ZIP export
+- Experimental conditioning rebalance toggle with preset/manual 12-layer weights
 - VRAM unload button
 - Basic local prompt guard
 
@@ -66,6 +67,29 @@ The container maps these to:
 /workspace/checkpoints/turbo.safetensors
 /workspace/checkpoints/raw.safetensors
 ```
+
+## Experimental conditioning rebalance
+
+The Generate tab includes an optional **Conditioning rebalance / experimental weights** section. This ports the intent of the ComfyUI-style Krea-2 conditioning rebalance node into the local Krea-2 sampler.
+
+What it does:
+
+- Adds an **Enable conditioning rebalance** toggle.
+- Adds a **Weight preset** selector and **Apply weight preset** button.
+- Adds a global conditioning multiplier.
+- Adds a manual comma-separated weight field.
+- Adds 12 layer sliders for direct tuning of the expected 12 Qwen3-VL conditioning taps.
+- Saves the selected conditioning settings into each run's `metadata.json`.
+
+Implementation detail: the official Krea sampler encodes the prompt internally and sends `txt` into `model(..., context=txt, ...)`. This UI adds a local sampler wrapper that scales only the positive text conditioning tensor after `encoder(prompts)` and before denoising. Negative CFG conditioning is left untouched.
+
+The default experimental weights are:
+
+```text
+1.0,1.0,1.0,1.0,1.0,1.0,1.0,2.5,5.0,1.1,4.0,1.0
+```
+
+Start with the toggle disabled. Then test the same prompt/seed with `Krea2 ComfyUI default`, `Late layer detail boost`, and `Balanced structure boost`. If outputs become overcooked or unstable, lower the global multiplier first.
 
 ## Recommended generation settings
 

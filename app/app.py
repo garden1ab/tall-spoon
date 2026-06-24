@@ -9,6 +9,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+from PIL import Image
+
 import gradio as gr
 import psutil
 import torch
@@ -18,7 +20,8 @@ KREA_REPO = Path(os.getenv("KREA_REPO", "/workspace/krea-2"))
 sys.path.insert(0, str(KREA_REPO))
 
 import inference as krea_inference  # type: ignore  # noqa: E402
-from sampling import sample  # type: ignore  # noqa: E402
+from einops import rearrange  # type: ignore  # noqa: E402
+from sampling import prepare, roundup, sample, timesteps  # type: ignore  # noqa: E402
 
 from download_models import download_checkpoint  # noqa: E402
 from safety import check_prompt  # noqa: E402
@@ -32,6 +35,18 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
 _PIPELINE_CACHE: dict[tuple[str, str, str], tuple[Any, Any, Any]] = {}
+
+
+DEFAULT_CONDITIONING_WEIGHTS = "1.0,1.0,1.0,1.0,1.0,1.0,1.0,2.5,5.0,1.1,4.0,1.0"
+
+CONDITIONING_PRESETS: dict[str, tuple[bool, float, list[float]]] = {
+    "Off / untouched": (False, 1.0, [1.0] * 12),
+    "Neutral global multiplier only": (True, 1.0, [1.0] * 12),
+    "Krea2 ComfyUI default": (True, 4.0, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.5, 5.0, 1.1, 4.0, 1.0]),
+    "Late layer detail boost": (True, 2.0, [1.0, 1.0, 1.0, 1.0, 1.1, 1.2, 1.4, 2.0, 3.0, 1.2, 2.5, 1.0]),
+    "Balanced structure boost": (True, 1.5, [1.2, 1.2, 1.15, 1.15, 1.1, 1.1, 1.0, 1.25, 1.4, 1.0, 1.25, 1.0]),
+    "Aggressive prompt adherence": (True, 3.0, [1.0, 1.0, 1.0, 1.1, 1.25, 1.5, 1.75, 2.5, 4.0, 1.3, 3.0, 1.0]),
+}
 
 
 def _dtype_from_name(name: str):
@@ -98,6 +113,146 @@ def _metadata(**kwargs) -> dict[str, Any]:
     return data
 
 
+
+
+def _format_weights(weights: list[float]) -> str:
+    return ",".join(f"{float(w):.4g}" for w in weights)
+
+
+def _parse_per_layer(s: str | None) -> list[float] | None:
+    """Parse a comma/semicolon-separated list of conditioning layer gains."""
+    if not s:
+        return None
+    try:
+        vals = [float(x) for x in s.replace(";", ",").split(",") if x.strip()]
+    except ValueError:
+        return None
+    if len(vals) < 2:
+        return None
+    return vals
+
+
+def _scale_cond_tensor(t: torch.Tensor, multiplier: float, per_layer_weights: list[float] | None = None) -> torch.Tensor:
+    """Scale Krea-2/Qwen conditioning, optionally per selected text-encoder tap.
+
+    Krea-2 conditioning is expected to arrive as (B, seq, 12*2560), where the
+    12 Qwen3-VL taps are flattened into the feature dimension. When the shape
+    does not divide cleanly by the weight count, this safely falls back to a
+    global multiplier only.
+    """
+    multiplier = float(multiplier)
+    if per_layer_weights is None:
+        return t * multiplier
+
+    flat = t.shape[-1]
+    n_layers = len(per_layer_weights)
+    if n_layers > 1 and flat % n_layers == 0:
+        layer_dim = flat // n_layers
+        orig_dtype = t.dtype
+        work = t.float().view(*t.shape[:-1], n_layers, layer_dim)
+        gains = torch.tensor(per_layer_weights, dtype=work.dtype, device=work.device)
+        work = work * gains.view(*([1] * (work.dim() - 2)), n_layers, 1)
+        work = work.view(*work.shape[:-2], flat)
+        return work.to(orig_dtype) * multiplier
+
+    return t * multiplier
+
+
+def conditioning_preset(name: str):
+    enabled, multiplier, weights = CONDITIONING_PRESETS.get(name, CONDITIONING_PRESETS["Krea2 ComfyUI default"])
+    return [enabled, multiplier, _format_weights(weights), *weights]
+
+
+@torch.no_grad()
+def sample_with_conditioning_rebalance(
+    model,
+    ae,
+    encoder,
+    prompts,
+    *,
+    negative_prompts=None,
+    device="cuda",
+    dtype=torch.bfloat16,
+    width=1024,
+    height=1024,
+    steps=28,
+    guidance=4.5,
+    seed=0,
+    minres=256,
+    maxres=1280,
+    y1=0.5,
+    y2=1.15,
+    mu=None,
+    conditioning_multiplier: float = 1.0,
+    per_layer_weights: list[float] | None = None,
+):
+    """Krea-2 sampler variant that rebalances only positive text conditioning.
+
+    This mirrors the official `sampling.sample` implementation and changes one
+    thing: after `encoder(prompts)`, the positive `txt` conditioning tensor is
+    globally/per-layer scaled before being passed to the MMDiT. Negative CFG
+    conditioning is intentionally left untouched.
+    """
+    patch = model.config.patch
+    align = ae.compression * patch
+    width, height = roundup(width, align, "width"), roundup(height, align, "height")
+    n = len(prompts)
+    cfg = guidance > 0
+    if negative_prompts is None:
+        negative_prompts = [""] * n
+
+    noise = torch.cat(
+        [
+            torch.randn(
+                1,
+                ae.channels,
+                height // ae.compression,
+                width // ae.compression,
+                device=device,
+                dtype=dtype,
+                generator=torch.Generator(device=device).manual_seed(seed + i),
+            )
+            for i in range(n)
+        ],
+        dim=0,
+    )
+
+    txt, txtmask = encoder(prompts)
+    txt = _scale_cond_tensor(txt, conditioning_multiplier, per_layer_weights)
+    x, pos, mask = prepare(noise, txt.shape[1], patch, txtmask)
+
+    if cfg:
+        untxt, untxtmask = encoder(negative_prompts)
+        _, unpos, unmask = prepare(noise, untxt.shape[1], patch, untxtmask)
+
+    x1 = (minres // (ae.compression * patch)) ** 2
+    x2 = (maxres // (ae.compression * patch)) ** 2
+    ts = timesteps(x.shape[1], steps, x1, x2, y1=y1, y2=y2, mu=mu)
+
+    img = x
+    for tcurr, tprev in zip(ts[:-1], ts[1:]):
+        t = torch.full((len(img),), tcurr, dtype=img.dtype, device=img.device)
+        cond = model(img=img, context=txt, t=t, pos=pos, mask=mask)
+        if cfg:
+            uncond = model(img=img, context=untxt, t=t, pos=unpos, mask=unmask)
+            v = cond + guidance * (cond - uncond)
+        else:
+            v = cond
+        img = img + (tprev - tcurr) * v
+
+    img = rearrange(
+        img,
+        "b (h w) (c ph pw) -> b c (h ph) (w pw)",
+        ph=patch,
+        pw=patch,
+        h=height // (ae.compression * patch),
+        w=width // (ae.compression * patch),
+    )
+    img = ae.decode(img.to(torch.bfloat16))
+    img = img.clamp(-1, 1) * 0.5 + 0.5
+    img = rearrange(img * 255.0, "b c h w -> b h w c").cpu().byte().numpy()
+    return [Image.fromarray(img[i]) for i in range(len(img))]
+
 def generate(
     prompt: str,
     checkpoint: str,
@@ -114,6 +269,22 @@ def generate(
     dtype_name: str,
     raw_path: str,
     turbo_path: str,
+    cond_rebalance_enabled: bool,
+    cond_multiplier: float,
+    cond_per_layer_weights: str,
+    cond_use_layer_sliders: bool,
+    cond_l01: float,
+    cond_l02: float,
+    cond_l03: float,
+    cond_l04: float,
+    cond_l05: float,
+    cond_l06: float,
+    cond_l07: float,
+    cond_l08: float,
+    cond_l09: float,
+    cond_l10: float,
+    cond_l11: float,
+    cond_l12: float,
 ):
     prompt = (prompt or "").strip()
     if not prompt:
@@ -134,21 +305,57 @@ def generate(
     dit, ae, encoder = _get_pipeline(checkpoint, dtype_name, raw_path or None, turbo_path or None)
 
     yield [], None, "Generating images."
+
+    parsed_layer_weights = None
+    if cond_rebalance_enabled:
+        if cond_use_layer_sliders:
+            parsed_layer_weights = [
+                float(cond_l01), float(cond_l02), float(cond_l03), float(cond_l04),
+                float(cond_l05), float(cond_l06), float(cond_l07), float(cond_l08),
+                float(cond_l09), float(cond_l10), float(cond_l11), float(cond_l12),
+            ]
+        else:
+            parsed_layer_weights = _parse_per_layer(cond_per_layer_weights)
+            if parsed_layer_weights is None:
+                raise gr.Error("Per-layer weights must be a comma-separated list of at least two numbers, or enable the 12 layer sliders.")
+        if len(parsed_layer_weights) != 12:
+            gr.Warning(f"Expected 12 Krea/Qwen layer weights; got {len(parsed_layer_weights)}. If the tensor shape is not divisible by that count, only the global multiplier will apply.")
+
     with torch.inference_mode():
-        images = sample(
-            dit,
-            ae,
-            encoder,
-            [prompt] * int(num_images),
-            width=int(width),
-            height=int(height),
-            steps=int(steps),
-            guidance=float(cfg),
-            seed=int(seed),
-            y1=float(y1),
-            y2=float(y2),
-            mu=float(mu) if use_mu and mu is not None else None,
-        )
+        if cond_rebalance_enabled:
+            images = sample_with_conditioning_rebalance(
+                dit,
+                ae,
+                encoder,
+                [prompt] * int(num_images),
+                device=DEVICE,
+                dtype=_dtype_from_name(dtype_name),
+                width=int(width),
+                height=int(height),
+                steps=int(steps),
+                guidance=float(cfg),
+                seed=int(seed),
+                y1=float(y1),
+                y2=float(y2),
+                mu=float(mu) if use_mu and mu is not None else None,
+                conditioning_multiplier=float(cond_multiplier),
+                per_layer_weights=parsed_layer_weights,
+            )
+        else:
+            images = sample(
+                dit,
+                ae,
+                encoder,
+                [prompt] * int(num_images),
+                width=int(width),
+                height=int(height),
+                steps=int(steps),
+                guidance=float(cfg),
+                seed=int(seed),
+                y1=float(y1),
+                y2=float(y2),
+                mu=float(mu) if use_mu and mu is not None else None,
+            )
 
     run_id = time.strftime("%Y%m%d-%H%M%S") + f"-{checkpoint}-{seed}"
     run_dir = OUTPUT_DIR / run_id
@@ -174,6 +381,10 @@ def generate(
         num_images=num_images,
         seed=seed,
         dtype=dtype_name,
+        conditioning_rebalance_enabled=bool(cond_rebalance_enabled),
+        conditioning_multiplier=float(cond_multiplier) if cond_rebalance_enabled else 1.0,
+        conditioning_per_layer_weights=parsed_layer_weights if cond_rebalance_enabled else None,
+        conditioning_positive_only=True if cond_rebalance_enabled else None,
         files=[str(p) for p in saved],
     )
     (run_dir / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -273,6 +484,42 @@ with gr.Blocks(title="Krea-2 Local UI", css=CSS) as demo:
                         num_images = gr.Slider(1, 4, value=1, step=1, label="Images")
                         seed = gr.Number(value=0, precision=0, label="Seed")
                     dtype_name = gr.Dropdown(["bfloat16", "float16", "float32"], value=DEFAULT_DTYPE, label="Runtime dtype")
+                with gr.Accordion("Conditioning rebalance / experimental weights", open=False):
+                    gr.Markdown(
+                        "Scales Krea-2's positive Qwen conditioning before denoising. "
+                        "This is experimental and is most useful for comparing prompt adherence/detail changes. "
+                        "Negative CFG conditioning is left untouched."
+                    )
+                    cond_rebalance_enabled = gr.Checkbox(value=False, label="Enable conditioning rebalance")
+                    with gr.Row():
+                        cond_preset = gr.Dropdown(
+                            choices=list(CONDITIONING_PRESETS.keys()),
+                            value="Krea2 ComfyUI default",
+                            label="Weight preset",
+                        )
+                        cond_preset_btn = gr.Button("Apply weight preset")
+                    cond_multiplier = gr.Slider(0, 8, value=4.0, step=0.01, label="Global conditioning multiplier")
+                    cond_per_layer_weights = gr.Textbox(
+                        value=DEFAULT_CONDITIONING_WEIGHTS,
+                        label="Manual per-layer weights",
+                        placeholder="12 comma-separated values, for example: 1,1,1,1,1,1,1,2.5,5,1.1,4,1",
+                    )
+                    cond_use_layer_sliders = gr.Checkbox(value=True, label="Use the 12 layer sliders below instead of the manual text field")
+                    with gr.Row():
+                        cond_l01 = gr.Slider(0, 8, value=1.0, step=0.05, label="Layer 01")
+                        cond_l02 = gr.Slider(0, 8, value=1.0, step=0.05, label="Layer 02")
+                        cond_l03 = gr.Slider(0, 8, value=1.0, step=0.05, label="Layer 03")
+                        cond_l04 = gr.Slider(0, 8, value=1.0, step=0.05, label="Layer 04")
+                    with gr.Row():
+                        cond_l05 = gr.Slider(0, 8, value=1.0, step=0.05, label="Layer 05")
+                        cond_l06 = gr.Slider(0, 8, value=1.0, step=0.05, label="Layer 06")
+                        cond_l07 = gr.Slider(0, 8, value=1.0, step=0.05, label="Layer 07")
+                        cond_l08 = gr.Slider(0, 8, value=2.5, step=0.05, label="Layer 08")
+                    with gr.Row():
+                        cond_l09 = gr.Slider(0, 8, value=5.0, step=0.05, label="Layer 09")
+                        cond_l10 = gr.Slider(0, 8, value=1.1, step=0.05, label="Layer 10")
+                        cond_l11 = gr.Slider(0, 8, value=4.0, step=0.05, label="Layer 11")
+                        cond_l12 = gr.Slider(0, 8, value=1.0, step=0.05, label="Layer 12")
                 with gr.Accordion("Manual checkpoint paths", open=False):
                     turbo_path = gr.Textbox(value=os.getenv("OSS_TURBO", str(CHECKPOINT_DIR / "turbo.safetensors")), label="Turbo safetensors path")
                     raw_path = gr.Textbox(value=os.getenv("OSS_RAW", str(CHECKPOINT_DIR / "raw.safetensors")), label="RAW safetensors path")
@@ -287,9 +534,23 @@ with gr.Blocks(title="Krea-2 Local UI", css=CSS) as demo:
             inputs=[checkpoint],
             outputs=[width, height, steps, cfg, y1, y2, mu, use_mu],
         )
+        cond_layer_sliders = [
+            cond_l01, cond_l02, cond_l03, cond_l04, cond_l05, cond_l06,
+            cond_l07, cond_l08, cond_l09, cond_l10, cond_l11, cond_l12,
+        ]
+        cond_preset_btn.click(
+            conditioning_preset,
+            inputs=[cond_preset],
+            outputs=[cond_rebalance_enabled, cond_multiplier, cond_per_layer_weights, *cond_layer_sliders],
+        )
         generate_btn.click(
             generate,
-            inputs=[prompt, checkpoint, width, height, steps, cfg, y1, y2, mu, use_mu, num_images, seed, dtype_name, raw_path, turbo_path],
+            inputs=[
+                prompt, checkpoint, width, height, steps, cfg, y1, y2, mu, use_mu,
+                num_images, seed, dtype_name, raw_path, turbo_path,
+                cond_rebalance_enabled, cond_multiplier, cond_per_layer_weights, cond_use_layer_sliders,
+                *cond_layer_sliders,
+            ],
             outputs=[gallery, zip_file, status],
         )
 
@@ -323,7 +584,7 @@ with gr.Blocks(title="Krea-2 Local UI", css=CSS) as demo:
     with gr.Tab("Notes"):
         gr.Markdown(
             "## Scope\n"
-            "This UI exposes the official open Krea-2 inference controls: prompt, RAW/Turbo checkpoint selection, steps, CFG, y1/y2 timestep shift, fixed mu, width, height, image count, seed, and output prefix/history.\n\n"
+            "This UI exposes the official open Krea-2 inference controls: prompt, RAW/Turbo checkpoint selection, steps, CFG, y1/y2 timestep shift, fixed mu, width, height, image count, seed, and output prefix/history. It also includes an optional experimental conditioning-rebalance wrapper that scales the positive Qwen conditioning tensor before sampling.\n\n"
             "The open Krea-2 repository does not include a full local clone of every hosted Krea product feature such as video generation, enhancer, realtime canvas, motion transfer, lip sync, or 3D tools. It also does not ship a local LoRA trainer in the official inference repo. For LoRA workflows, train on RAW using a trainer such as Diffusers/Ostris/Kohya, then use Turbo for inference when compatible support is available."
         )
 
