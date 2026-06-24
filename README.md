@@ -113,6 +113,20 @@ resolution: 1024x1024 recommended
 
 ## Troubleshooting
 
+### `Python.h: No such file or directory` / Triton or Torch Inductor compile error
+
+This means the Docker image was built without Python development headers. This project now installs `python3.12-dev`, `build-essential`, and `pkg-config` in the image. Rebuild the image, not just `docker compose up`:
+
+```bash
+docker compose down
+docker compose build --no-cache
+docker compose up
+```
+
+### `accelerate` warning during model loading
+
+The runtime now includes `accelerate>=0.34` in the `uv run` command. Rebuild the image if the warning persists.
+
 ### CUDA is not available inside the container
 
 Check that NVIDIA Container Toolkit is installed and working:

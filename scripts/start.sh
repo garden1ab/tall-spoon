@@ -16,4 +16,5 @@ uv run \
   --with "gradio>=4.44,<6" \
   --with "huggingface_hub>=0.25" \
   --with "psutil>=5.9" \
+  --with "accelerate>=0.34" \
   /workspace/app/app.py

@@ -11,7 +11,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     ca-certificates \
+    build-essential \
+    pkg-config \
     python3.12 \
+    python3.12-dev \
     python3.12-venv \
     python3-pip \
     libgl1 \
