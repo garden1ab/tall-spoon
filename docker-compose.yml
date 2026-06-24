@@ -1,0 +1,29 @@
+services:
+  krea2-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: krea2-local-ui
+    ports:
+      - "7860:7860"
+    env_file:
+      - .env
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - ./checkpoints:/workspace/checkpoints
+      - ./outputs:/workspace/outputs
+      - hf-cache:/workspace/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    shm_size: "16gb"
+    ipc: host
+
+volumes:
+  hf-cache:
