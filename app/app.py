@@ -91,6 +91,7 @@ CONDITIONING_PRESETS: dict[str, tuple[bool, float, list[float]]] = {
     "Late layer detail boost": (True, 2.0, [1.0, 1.0, 1.0, 1.0, 1.1, 1.2, 1.4, 2.0, 3.0, 1.2, 2.5, 1.0]),
     "Balanced structure boost": (True, 1.5, [1.2, 1.2, 1.15, 1.15, 1.1, 1.1, 1.0, 1.25, 1.4, 1.0, 1.25, 1.0]),
     "Aggressive prompt adherence": (True, 3.0, [1.0, 1.0, 1.0, 1.1, 1.25, 1.5, 1.75, 2.5, 4.0, 1.3, 3.0, 1.0]),
+    "Extreme verification test": (True, 1.0, [0.25, 0.25, 0.25, 0.5, 0.75, 1.0, 1.25, 3.0, 8.0, 0.5, 6.0, 0.25]),
 }
 
 
@@ -280,30 +281,61 @@ def _parse_per_layer(s: str | None) -> list[float] | None:
     return vals
 
 
-def _scale_cond_tensor(t: torch.Tensor, multiplier: float, per_layer_weights: list[float] | None = None) -> torch.Tensor:
-    """Scale Krea-2/Qwen conditioning, optionally per selected text-encoder tap.
+def _tensor_stats(t: torch.Tensor) -> dict[str, Any]:
+    """Small, cheap stats used to verify conditioning changes in the UI."""
+    with torch.no_grad():
+        work = t.detach().float()
+        return {
+            "shape": list(t.shape),
+            "dtype": str(t.dtype).replace("torch.", ""),
+            "mean_abs": float(work.abs().mean().item()),
+            "std": float(work.std().item()),
+            "max_abs": float(work.abs().max().item()),
+        }
 
-    Krea-2 conditioning is expected to arrive as (B, seq, 12*2560), where the
-    12 Qwen3-VL taps are flattened into the feature dimension. When the shape
-    does not divide cleanly by the weight count, this safely falls back to a
-    global multiplier only.
+
+def _scale_cond_tensor(
+    t: torch.Tensor,
+    multiplier: float,
+    per_layer_weights: list[float] | None = None,
+) -> tuple[torch.Tensor, str]:
+    """Scale Krea-2/Qwen conditioning and report exactly what was applied.
+
+    The official Krea-2 encoder usually returns a 4D tensor shaped
+    (B, seq, 12, D). The previous UI only handled flattened ComfyUI-style
+    tensors shaped (B, seq, 12*D), so the 12 per-layer weights silently fell
+    back to a global multiplier. A global multiplier alone can be muted by
+    RMSNorm inside Krea-2's text-fusion path, which is why the control could
+    appear to do almost nothing.
     """
     multiplier = float(multiplier)
     if per_layer_weights is None:
-        return t * multiplier
+        return t * multiplier, "global-only"
 
-    flat = t.shape[-1]
     n_layers = len(per_layer_weights)
+    orig_dtype = t.dtype
+
+    # Official Krea-2 path: (B, seq, 12, D). Apply gains along the selected
+    # Qwen hidden-state/tap axis.
+    if n_layers > 1 and t.dim() >= 4 and t.shape[-2] == n_layers:
+        work = t.float()
+        gains = torch.tensor(per_layer_weights, dtype=work.dtype, device=work.device)
+        view_shape = [1] * work.dim()
+        view_shape[-2] = n_layers
+        work = work * gains.view(*view_shape)
+        return work.to(orig_dtype) * multiplier, "4d-layer-axis"
+
+    # ComfyUI-style fallback: (B, seq, 12*D).
+    flat = t.shape[-1]
     if n_layers > 1 and flat % n_layers == 0:
         layer_dim = flat // n_layers
-        orig_dtype = t.dtype
         work = t.float().view(*t.shape[:-1], n_layers, layer_dim)
         gains = torch.tensor(per_layer_weights, dtype=work.dtype, device=work.device)
         work = work * gains.view(*([1] * (work.dim() - 2)), n_layers, 1)
         work = work.view(*work.shape[:-2], flat)
-        return work.to(orig_dtype) * multiplier
+        return work.to(orig_dtype) * multiplier, "flattened-layer-axis"
 
-    return t * multiplier
+    return t * multiplier, "global-only-shape-mismatch"
 
 
 def conditioning_preset(name: str):
@@ -366,7 +398,18 @@ def sample_with_conditioning_rebalance(
     )
 
     txt, txtmask = encoder(prompts)
-    txt = _scale_cond_tensor(txt, conditioning_multiplier, per_layer_weights)
+    cond_before = _tensor_stats(txt)
+    txt, conditioning_applied_mode = _scale_cond_tensor(txt, conditioning_multiplier, per_layer_weights)
+    cond_after = _tensor_stats(txt)
+    conditioning_debug = {
+        "applied_mode": conditioning_applied_mode,
+        "multiplier": float(conditioning_multiplier),
+        "weights": per_layer_weights,
+        "before": cond_before,
+        "after": cond_after,
+        "mean_abs_ratio": (cond_after["mean_abs"] / cond_before["mean_abs"]) if cond_before["mean_abs"] else None,
+        "std_ratio": (cond_after["std"] / cond_before["std"]) if cond_before["std"] else None,
+    }
     x, pos, mask = prepare(noise, txt.shape[1], patch, txtmask)
 
     if cfg:
@@ -399,7 +442,7 @@ def sample_with_conditioning_rebalance(
     img = ae.decode(img.to(torch.bfloat16))
     img = img.clamp(-1, 1) * 0.5 + 0.5
     img = rearrange(img * 255.0, "b c h w -> b h w c").cpu().byte().numpy()
-    return [Image.fromarray(img[i]) for i in range(len(img))]
+    return [Image.fromarray(img[i]) for i in range(len(img))], conditioning_debug
 
 def generate(
     prompt: str,
@@ -489,7 +532,7 @@ def generate(
     try:
         with torch.inference_mode():
             if cond_rebalance_enabled:
-                images = sample_with_conditioning_rebalance(
+                images, conditioning_debug = sample_with_conditioning_rebalance(
                     dit,
                     ae,
                     encoder,
@@ -508,6 +551,7 @@ def generate(
                     per_layer_weights=parsed_layer_weights,
                 )
             else:
+                conditioning_debug = {"applied_mode": "disabled"}
                 images = sample(
                     dit,
                     ae,
@@ -560,6 +604,7 @@ def generate(
         conditioning_multiplier=float(cond_multiplier) if cond_rebalance_enabled else 1.0,
         conditioning_per_layer_weights=parsed_layer_weights if cond_rebalance_enabled else None,
         conditioning_positive_only=True if cond_rebalance_enabled else None,
+        conditioning_debug=conditioning_debug,
         files=[str(p) for p in saved],
     )
     (run_dir / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -570,10 +615,22 @@ def generate(
     per_image = gen_elapsed / max(1, len(saved))
 
     gallery = [(str(p), f"seed {seed + i}") for i, p in enumerate(saved)]
+    conditioning_status = "Conditioning rebalance: disabled"
+    if cond_rebalance_enabled:
+        before = conditioning_debug.get("before", {})
+        after = conditioning_debug.get("after", {})
+        conditioning_status = (
+            f"Conditioning rebalance: {conditioning_debug.get('applied_mode')} | "
+            f"shape {before.get('shape')} | "
+            f"mean_abs {before.get('mean_abs', 0):.4f} -> {after.get('mean_abs', 0):.4f} | "
+            f"std {before.get('std', 0):.4f} -> {after.get('std', 0):.4f}"
+        )
+
     yield gallery, str(zip_path), (
         f"Saved {len(saved)} image(s) to {run_dir}\n"
         f"Timing: load/cache {_seconds(load_elapsed)} | generate {_seconds(gen_elapsed)} "
         f"({_seconds(per_image)} per image) | save {_seconds(save_elapsed)} | total {_seconds(total_elapsed)}\n"
+        f"{conditioning_status}\n"
         f"Torch compile disabled: {DISABLE_TORCH_COMPILE}"
     )
 
@@ -791,8 +848,8 @@ with gr.Blocks(title="Krea-2 Local UI", css=CSS) as demo:
                 with gr.Accordion("Conditioning rebalance / experimental weights", open=False):
                     gr.Markdown(
                         "Scales Krea-2's positive Qwen conditioning before denoising. "
-                        "This is experimental and is most useful for comparing prompt adherence/detail changes. "
-                        "Negative CFG conditioning is left untouched."
+                        "This build detects official Krea-2's 4D conditioning shape `(B, seq, 12, D)` and applies the 12 weights on the correct layer/tap axis. "
+                        "The status box reports tensor stats so you can verify the conditioning actually changed. Negative CFG conditioning is left untouched."
                     )
                     cond_rebalance_enabled = gr.Checkbox(value=False, label="Enable conditioning rebalance")
                     with gr.Row():
@@ -916,7 +973,7 @@ with gr.Blocks(title="Krea-2 Local UI", css=CSS) as demo:
     with gr.Tab("Notes"):
         gr.Markdown(
             "## Scope\n"
-            "This UI exposes the official open Krea-2 inference controls: prompt, RAW/Turbo checkpoint selection, steps, CFG, y1/y2 timestep shift, fixed mu, width, height, image count, seed, and output prefix/history. It also includes an optional experimental conditioning-rebalance wrapper that scales the positive Qwen conditioning tensor before sampling.\n\n"
+            "This UI exposes the official open Krea-2 inference controls: prompt, RAW/Turbo checkpoint selection, steps, CFG, y1/y2 timestep shift, fixed mu, width, height, image count, seed, and output prefix/history. It also includes an optional experimental conditioning-rebalance wrapper that scales the positive Qwen conditioning tensor before sampling. The wrapper supports both official Krea-2 4D conditioning tensors and flattened ComfyUI-style tensors, and reports before/after tensor stats in the status box.\n\n"
             "The open Krea-2 repository does not include a full local clone of every hosted Krea product feature such as video generation, enhancer, realtime canvas, motion transfer, lip sync, or 3D tools. It also does not ship a local LoRA trainer in the official inference repo. For LoRA workflows, train on RAW using a trainer such as Diffusers/Ostris/Kohya, then use Turbo for inference when compatible support is available."
         )
 

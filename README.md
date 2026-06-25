@@ -116,9 +116,10 @@ What it does:
 - Adds a global conditioning multiplier.
 - Adds a manual comma-separated weight field.
 - Adds 12 layer sliders for direct tuning of the expected 12 Qwen3-VL conditioning taps.
-- Saves the selected conditioning settings into each run's `metadata.json`.
+- Saves the selected conditioning settings and before/after tensor stats into each run's `metadata.json`.
+- Reports the applied tensor mode in the status box after generation. A working official Krea-2 path should show `4d-layer-axis`.
 
-Implementation detail: the official Krea sampler encodes the prompt internally and sends `txt` into `model(..., context=txt, ...)`. This UI adds a local sampler wrapper that scales only the positive text conditioning tensor after `encoder(prompts)` and before denoising. Negative CFG conditioning is left untouched.
+Implementation detail: the official Krea sampler encodes the prompt internally and sends `txt` into `model(..., context=txt, ...)`. Official Krea-2 currently passes the text tensor into `TextFusionTransformer`, which expects `(B, seq, 12, D)` conditioning. Earlier builds only handled the flattened ComfyUI-style `(B, seq, 12*D)` case, so the 12 layer sliders could silently fall back to global-only scaling. This build supports both tensor layouts and scales only the positive text conditioning tensor after `encoder(prompts)` and before denoising. Negative CFG conditioning is left untouched.
 
 The default experimental weights are:
 
@@ -126,7 +127,7 @@ The default experimental weights are:
 1.0,1.0,1.0,1.0,1.0,1.0,1.0,2.5,5.0,1.1,4.0,1.0
 ```
 
-Start with the toggle disabled. Then test the same prompt/seed with `Krea2 ComfyUI default`, `Late layer detail boost`, and `Balanced structure boost`. If outputs become overcooked or unstable, lower the global multiplier first.
+Start with the toggle disabled. Then test the same prompt/seed with `Krea2 ComfyUI default`, `Late layer detail boost`, and `Balanced structure boost`. To verify that the control path is active, use `Extreme verification test` once with the same seed; the image should visibly change, and the status box should report different before/after conditioning stats. If outputs become overcooked or unstable, lower the global multiplier first.
 
 ## Recommended generation settings
 
