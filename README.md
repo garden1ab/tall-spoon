@@ -40,6 +40,8 @@ docker compose build
 docker compose up
 ```
 
+Python package dependencies are installed during `docker compose build`. Normal `docker compose up` startup should not download Gradio, pandas, ruff, accelerate, or other Python tools. Runtime downloads should be limited to model assets you have not already cached, such as the Hugging Face text encoder or checkpoint files requested from the Model Tools tab.
+
 Open:
 
 ```text
@@ -150,9 +152,25 @@ docker compose build --no-cache
 docker compose up
 ```
 
+### Python packages download every time `docker compose up` starts
+
+That means the old startup script is still being used. This build installs UI dependencies during `docker compose build` from `requirements-app.txt`, then starts with the already-built virtual environment:
+
+```bash
+/workspace/krea-2/.venv/bin/python /workspace/app/app.py
+```
+
+Use a no-cache rebuild if startup still shows `Downloading gradio`, `Downloading pandas`, `Downloading ruff`, or similar package logs:
+
+```bash
+docker compose down
+docker compose build --no-cache
+docker compose up
+```
+
 ### `accelerate` warning during model loading
 
-The runtime now includes `accelerate>=0.34` in the `uv run` command. Rebuild the image if the warning persists.
+`accelerate>=0.34` is now installed into the image at build time. Rebuild the image if the warning persists.
 
 ### CUDA is not available inside the container
 
@@ -189,7 +207,7 @@ Download from the Model Tools tab or manually place the safetensors files into `
 
 ### First generation is slow
 
-The first run loads the Krea checkpoint and downloads/initializes the Qwen text encoder. Later generations are faster while the model remains cached in VRAM.
+The first run loads the Krea checkpoint and may download/initialize the Qwen text encoder into the Hugging Face cache if it is not already present. Later generations are faster while the model remains cached in VRAM. To avoid text-encoder downloads at runtime, prewarm the cache by running one generation while online, then keep the `hf-cache` Docker volume.
 
 ## Updating Krea-2 official code
 

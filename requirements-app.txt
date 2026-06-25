@@ -1,0 +1,6 @@
+# App/UI dependencies installed at image build time.
+# Do not install these at container startup unless KREA2_REPAIR_DEPS=1 is set.
+gradio>=4.44,<6
+huggingface_hub>=0.25
+psutil>=5.9
+accelerate>=0.34

@@ -28,8 +28,15 @@ WORKDIR /workspace
 ARG KREA2_REF=main
 RUN git clone --depth=1 --branch ${KREA2_REF} https://github.com/krea-ai/krea-2.git /workspace/krea-2
 
+COPY requirements-app.txt /workspace/requirements-app.txt
+
 WORKDIR /workspace/krea-2
-RUN uv sync
+RUN uv sync && \
+    uv pip install --python /workspace/krea-2/.venv/bin/python -r /workspace/requirements-app.txt && \
+    /workspace/krea-2/.venv/bin/python - <<'PYVERIFY'
+import gradio, huggingface_hub, psutil, accelerate
+print("Krea-2 local UI app dependencies installed at build time.")
+PYVERIFY
 
 COPY app/ /workspace/app/
 COPY scripts/start.sh /workspace/start.sh

@@ -12,9 +12,12 @@ if [[ -z "${OSS_RAW:-}" && -f "/workspace/checkpoints/raw.safetensors" ]]; then
 fi
 
 cd /workspace/krea-2
-uv run \
-  --with "gradio>=4.44,<6" \
-  --with "huggingface_hub>=0.25" \
-  --with "psutil>=5.9" \
-  --with "accelerate>=0.34" \
-  /workspace/app/app.py
+
+# Normal startup should not download or resolve Python packages.
+# Set KREA2_REPAIR_DEPS=1 only when you intentionally want to repair/reinstall app deps.
+if [[ "${KREA2_REPAIR_DEPS:-0}" == "1" ]]; then
+  echo "KREA2_REPAIR_DEPS=1 set; reinstalling app dependencies into the existing venv..."
+  uv pip install --python /workspace/krea-2/.venv/bin/python -r /workspace/requirements-app.txt
+fi
+
+exec /workspace/krea-2/.venv/bin/python /workspace/app/app.py
