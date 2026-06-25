@@ -35,6 +35,17 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
 _PIPELINE_CACHE: dict[tuple[str, str, str], tuple[Any, Any, Any]] = {}
+MAX_CACHED_PIPELINES = int(os.getenv("KREA2_MAX_CACHED_PIPELINES", "1"))
+
+
+def _clear_pipeline_cache() -> None:
+    """Release cached Krea pipelines and return as much VRAM as possible."""
+    _PIPELINE_CACHE.clear()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
 
 
 DEFAULT_CONDITIONING_WEIGHTS = "1.0,1.0,1.0,1.0,1.0,1.0,1.0,2.5,5.0,1.1,4.0,1.0"
@@ -85,6 +96,13 @@ def _get_pipeline(checkpoint: str, dtype_name: str, raw_path: str | None, turbo_
     key = (checkpoint, dtype_name, ckpt_path)
     if key in _PIPELINE_CACHE:
         return _PIPELINE_CACHE[key]
+
+    # Krea-2 is large. Keep only one resident pipeline unless explicitly changed.
+    # This prevents accidentally loading RAW + Turbo, or two dtype variants, on 16 GB cards.
+    if MAX_CACHED_PIPELINES <= 1 or len(_PIPELINE_CACHE) >= MAX_CACHED_PIPELINES:
+        _clear_pipeline_cache()
+    elif torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     dtype = _dtype_from_name(dtype_name)
     pipe = krea_inference._pipeline(checkpoint=checkpoint, device=DEVICE, dtype=dtype)
@@ -302,7 +320,14 @@ def generate(
 
     yield [], None, "Loading model. First load can take several minutes because the checkpoint and Qwen text encoder are initialized."
 
-    dit, ae, encoder = _get_pipeline(checkpoint, dtype_name, raw_path or None, turbo_path or None)
+    try:
+        dit, ae, encoder = _get_pipeline(checkpoint, dtype_name, raw_path or None, turbo_path or None)
+    except torch.cuda.OutOfMemoryError as exc:
+        _clear_pipeline_cache()
+        raise gr.Error(
+            "CUDA out of memory while loading Krea-2. Use Turbo, bfloat16, 1 image, and the 16 GB safe preset. "
+            "Then restart the container if VRAM is still reserved."
+        ) from exc
 
     yield [], None, "Generating images."
 
@@ -321,41 +346,48 @@ def generate(
         if len(parsed_layer_weights) != 12:
             gr.Warning(f"Expected 12 Krea/Qwen layer weights; got {len(parsed_layer_weights)}. If the tensor shape is not divisible by that count, only the global multiplier will apply.")
 
-    with torch.inference_mode():
-        if cond_rebalance_enabled:
-            images = sample_with_conditioning_rebalance(
-                dit,
-                ae,
-                encoder,
-                [prompt] * int(num_images),
-                device=DEVICE,
-                dtype=_dtype_from_name(dtype_name),
-                width=int(width),
-                height=int(height),
-                steps=int(steps),
-                guidance=float(cfg),
-                seed=int(seed),
-                y1=float(y1),
-                y2=float(y2),
-                mu=float(mu) if use_mu and mu is not None else None,
-                conditioning_multiplier=float(cond_multiplier),
-                per_layer_weights=parsed_layer_weights,
-            )
-        else:
-            images = sample(
-                dit,
-                ae,
-                encoder,
-                [prompt] * int(num_images),
-                width=int(width),
-                height=int(height),
-                steps=int(steps),
-                guidance=float(cfg),
-                seed=int(seed),
-                y1=float(y1),
-                y2=float(y2),
-                mu=float(mu) if use_mu and mu is not None else None,
-            )
+    try:
+        with torch.inference_mode():
+            if cond_rebalance_enabled:
+                images = sample_with_conditioning_rebalance(
+                    dit,
+                    ae,
+                    encoder,
+                    [prompt] * int(num_images),
+                    device=DEVICE,
+                    dtype=_dtype_from_name(dtype_name),
+                    width=int(width),
+                    height=int(height),
+                    steps=int(steps),
+                    guidance=float(cfg),
+                    seed=int(seed),
+                    y1=float(y1),
+                    y2=float(y2),
+                    mu=float(mu) if use_mu and mu is not None else None,
+                    conditioning_multiplier=float(cond_multiplier),
+                    per_layer_weights=parsed_layer_weights,
+                )
+            else:
+                images = sample(
+                    dit,
+                    ae,
+                    encoder,
+                    [prompt] * int(num_images),
+                    width=int(width),
+                    height=int(height),
+                    steps=int(steps),
+                    guidance=float(cfg),
+                    seed=int(seed),
+                    y1=float(y1),
+                    y2=float(y2),
+                    mu=float(mu) if use_mu and mu is not None else None,
+                )
+    except torch.cuda.OutOfMemoryError as exc:
+        _clear_pipeline_cache()
+        raise gr.Error(
+            "CUDA out of memory during generation. Use the 16 GB safe preset, set Images to 1, keep CFG at 0 for Turbo, "
+            "and avoid RAW on a 16 GB card unless you add offload/quantization support."
+        ) from exc
 
     run_id = time.strftime("%Y%m%d-%H%M%S") + f"-{checkpoint}-{seed}"
     run_dir = OUTPUT_DIR / run_id
@@ -400,12 +432,13 @@ def model_preset(checkpoint: str):
     return 1024, 1024, 52, 3.5, 0.5, 1.15, 0.0, False
 
 
+def safe_16gb_preset():
+    """Conservative settings for 16 GB GPUs / WSL2."""
+    return "oss_turbo", 768, 768, 8, 0.0, 0.5, 1.15, 1.15, True, 1, "bfloat16"
+
+
 def unload_models() -> str:
-    _PIPELINE_CACHE.clear()
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
+    _clear_pipeline_cache()
     return "Model cache cleared."
 
 
@@ -468,6 +501,7 @@ with gr.Blocks(title="Krea-2 Local UI", css=CSS) as demo:
                     label="Checkpoint",
                 )
                 preset_btn = gr.Button("Apply recommended preset")
+                safe_16gb_btn = gr.Button("Apply 16 GB safe preset")
                 with gr.Row():
                     width = gr.Slider(512, 2048, value=1024, step=16, label="Width")
                     height = gr.Slider(512, 2048, value=1024, step=16, label="Height")
@@ -534,6 +568,11 @@ with gr.Blocks(title="Krea-2 Local UI", css=CSS) as demo:
             inputs=[checkpoint],
             outputs=[width, height, steps, cfg, y1, y2, mu, use_mu],
         )
+        safe_16gb_btn.click(
+            safe_16gb_preset,
+            inputs=[],
+            outputs=[checkpoint, width, height, steps, cfg, y1, y2, mu, use_mu, num_images, dtype_name],
+        )
         cond_layer_sliders = [
             cond_l01, cond_l02, cond_l03, cond_l04, cond_l05, cond_l06,
             cond_l07, cond_l08, cond_l09, cond_l10, cond_l11, cond_l12,
@@ -593,4 +632,5 @@ if __name__ == "__main__":
         server_name=os.getenv("GRADIO_SERVER_NAME", "0.0.0.0"),
         server_port=int(os.getenv("GRADIO_SERVER_PORT", "7860")),
         share=False,
+        allowed_paths=[str(OUTPUT_DIR.resolve())],
     )

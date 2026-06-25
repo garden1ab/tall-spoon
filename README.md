@@ -13,6 +13,7 @@ A local Docker/Gradio interface for Krea-2 RAW and Turbo image generation using 
 - Output history and ZIP export
 - Experimental conditioning rebalance toggle with preset/manual 12-layer weights
 - VRAM unload button
+- 16 GB safe preset button for WSL2 / lower-VRAM cards
 - Basic local prompt guard
 
 ## What it does not provide
@@ -21,7 +22,7 @@ The open Krea-2 release is not the entire hosted Krea creative suite. This local
 
 ## Hardware notes
 
-Krea-2 uses a large 12B-class diffusion model. The Turbo and RAW safetensor files are each about 26 GB. A high-VRAM NVIDIA GPU is strongly recommended. Start with Turbo at 1024x1024 before trying 2048x2048.
+Krea-2 uses a large 12B-class diffusion model. The Turbo and RAW safetensor files are each about 26 GB. A high-VRAM NVIDIA GPU is strongly recommended. On 16 GB GPUs, start with the **Apply 16 GB safe preset** button: Turbo, bfloat16, 768x768, 1 image, 8 steps, CFG 0.0. After that works, try 896x896 or 1024x1024.
 
 ## Prerequisites
 
@@ -111,6 +112,32 @@ mu: disabled
 resolution: 1024x1024 recommended
 ```
 
+## WSL2 memory config note
+
+If WSL prints an error like:
+
+```text
+wsl: Expected ' ' or '\n' in C:\Users\AI Beast\.wslconfig:1
+```
+
+then your Windows-side `.wslconfig` is malformed. Shut down WSL and replace `C:\Users\AI Beast\.wslconfig` with a valid file like this:
+
+```ini
+[wsl2]
+memory=24GB
+processors=8
+swap=32GB
+localhostForwarding=true
+```
+
+Then run this in PowerShell:
+
+```powershell
+wsl --shutdown
+```
+
+Reopen Ubuntu/WSL and start Docker again. This does not increase GPU VRAM, but it helps prevent WSL memory parsing errors and CPU RAM pressure while loading the text encoder/checkpoints.
+
 ## Troubleshooting
 
 ### `Python.h: No such file or directory` / Triton or Torch Inductor compile error
@@ -135,9 +162,26 @@ Check that NVIDIA Container Toolkit is installed and working:
 docker run --rm --gpus all nvidia/cuda:12.8.1-base-ubuntu24.04 nvidia-smi
 ```
 
+### Gradio `InvalidPathError` for `/workspace/outputs/...png`
+
+This build launches Gradio with `/workspace/outputs` in `allowed_paths`, so generated PNGs and ZIP files can be displayed/downloaded from the mounted output directory. Rebuild if you still see this error:
+
+```bash
+docker compose down
+docker compose build --no-cache
+docker compose up
+```
+
 ### Out of memory
 
-Use Turbo, reduce resolution to 1024x1024, generate one image at a time, then click `Unload model from VRAM` before switching checkpoints.
+Use **Apply 16 GB safe preset** first. Keep Turbo selected, use bfloat16, generate one image at a time, and keep CFG at 0.0 for Turbo. Avoid RAW on a 16 GB card unless you add offload/quantization support. If VRAM remains reserved after an error, stop the container and restart it:
+
+```bash
+docker compose down
+docker compose up
+```
+
+This build also sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, `CUDA_MODULE_LOADING=LAZY`, and keeps only one Krea-2 pipeline cached in VRAM.
 
 ### Model checkpoint not found
 

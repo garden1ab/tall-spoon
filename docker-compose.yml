@@ -11,10 +11,15 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      - CUDA_MODULE_LOADING=LAZY
+      - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
+      - KREA2_MAX_CACHED_PIPELINES=1
     volumes:
       - ./checkpoints:/workspace/checkpoints
       - ./outputs:/workspace/outputs
       - hf-cache:/workspace/.cache/huggingface
+      - torchinductor-cache:/workspace/.cache/torchinductor
     deploy:
       resources:
         reservations:
@@ -27,3 +32,4 @@ services:
 
 volumes:
   hf-cache:
+  torchinductor-cache:
