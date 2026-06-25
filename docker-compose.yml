@@ -5,21 +5,32 @@ services:
       dockerfile: Dockerfile
     container_name: krea2-local-ui
     ports:
-      - "7860:7860"
+      - "127.0.0.1:7860:7860"
     env_file:
       - .env
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - KREA2_OFFLINE_MODE=1
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+      - HF_DATASETS_OFFLINE=1
+      - HF_HUB_DISABLE_TELEMETRY=1
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
       - CUDA_MODULE_LOADING=LAZY
       - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
+      - TRITON_CACHE_DIR=/workspace/.cache/triton
       - KREA2_MAX_CACHED_PIPELINES=1
+      - KREA2_DISABLE_TORCH_COMPILE=${KREA2_DISABLE_TORCH_COMPILE:-0}
     volumes:
       - ./checkpoints:/workspace/checkpoints
+      - ./models:/workspace/models
       - ./outputs:/workspace/outputs
       - hf-cache:/workspace/.cache/huggingface
       - torchinductor-cache:/workspace/.cache/torchinductor
+      - triton-cache:/workspace/.cache/triton
+    networks:
+      - krea2-runtime-local
     deploy:
       resources:
         reservations:
@@ -30,6 +41,40 @@ services:
     shm_size: "16gb"
     ipc: host
 
+  model-prep:
+    profiles: ["prepare"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: krea2-model-prep
+    env_file:
+      - .env
+    environment:
+      - KREA2_OFFLINE_MODE=0
+      - HF_HUB_OFFLINE=0
+      - TRANSFORMERS_OFFLINE=0
+      - HF_DATASETS_OFFLINE=0
+      - HF_HUB_DISABLE_TELEMETRY=1
+    volumes:
+      - ./checkpoints:/workspace/checkpoints
+      - ./models:/workspace/models
+      - hf-cache:/workspace/.cache/huggingface
+    networks:
+      - krea2-prep-online
+    command: ["/workspace/scripts/prepare-offline-cache.sh"]
+
 volumes:
   hf-cache:
   torchinductor-cache:
+  triton-cache:
+
+networks:
+  # Runtime UI network is intentionally internal. It exposes localhost:7860 to
+  # the host, but the container has no outbound internet route.
+  krea2-runtime-local:
+    driver: bridge
+    internal: true
+  # One-time preparation network has normal internet access and is only used
+  # with: docker compose --profile prepare run --rm model-prep
+  krea2-prep-online:
+    driver: bridge

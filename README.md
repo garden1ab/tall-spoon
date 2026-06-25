@@ -9,7 +9,8 @@ A local Docker/Gradio interface for Krea-2 RAW and Turbo image generation using 
 - Prompt, width, height, seed, image count
 - Official sampler controls: steps, CFG, y1, y2, fixed `mu`
 - Recommended presets for Turbo and RAW
-- Model download helper for `turbo.safetensors` and `raw.safetensors`
+- One-time online model preparation service for local/offline runtime
+- Hard-offline Generate path: local checkpoint files and local Qwen text encoder snapshot only
 - Output history and ZIP export
 - Experimental conditioning rebalance toggle with preset/manual 12-layer weights
 - VRAM unload button
@@ -32,15 +33,47 @@ Krea-2 uses a large 12B-class diffusion model. The Turbo and RAW safetensor file
 4. Enough disk space for Docker layers, Hugging Face cache, the Qwen text encoder, and Krea checkpoints.
 5. Optional but recommended: Hugging Face token, after accepting the Krea-2 model license.
 
-## Setup
+## Setup: local/offline runtime
+
+The normal UI runtime is hard-offline. `Generate` will not download Krea, Qwen, Gradio, Python packages, or Hugging Face files. All online work happens in one of these two explicit phases:
+
+1. Docker image build: installs Linux/Python dependencies and clones the Krea-2 inference repo.
+2. One-time model prep: downloads the Qwen text encoder snapshot and Krea checkpoint files into local mounted folders.
+
+Build the image:
 
 ```bash
 cp .env.example .env
 docker compose build
-docker compose up
 ```
 
-Python package dependencies are installed during `docker compose build`. Normal `docker compose up` startup should not download Gradio, pandas, ruff, accelerate, or other Python tools. Runtime downloads should be limited to model assets you have not already cached, such as the Hugging Face text encoder or checkpoint files requested from the Model Tools tab.
+While internet is available, prepare the local model cache:
+
+```bash
+docker compose --profile prepare run --rm model-prep
+```
+
+Default prep downloads:
+
+```text
+Qwen/Qwen3-VL-4B-Instruct -> ./models/Qwen-Qwen3-VL-4B-Instruct
+Qwen/Qwen-Image vae/* -> ./models/Qwen-Qwen-Image/vae
+krea/Krea-2-Turbo turbo.safetensors -> ./checkpoints/turbo.safetensors
+```
+
+RAW is off by default because it is also large and is not recommended for a 16 GB GPU. To include RAW, edit `.env`:
+
+```env
+KREA2_PREP_RAW=1
+```
+
+Then run the prep command again.
+
+Start the local-only runtime:
+
+```bash
+docker compose up
+```
 
 Open:
 
@@ -48,28 +81,29 @@ Open:
 http://localhost:7860
 ```
 
-## Download checkpoints
+The UI service is attached to an internal Docker network and binds Gradio only to localhost: `127.0.0.1:7860`. It also sets:
 
-Option A: Use the UI.
+```env
+KREA2_OFFLINE_MODE=1
+HF_HUB_OFFLINE=1
+TRANSFORMERS_OFFLINE=1
+HF_DATASETS_OFFLINE=1
+```
 
-1. Open the `Model Tools` tab.
-2. Select `Turbo`.
-3. Paste `HF_TOKEN` if needed.
-4. Click `Download selected checkpoint`.
+This means if the text encoder or checkpoint is missing, generation fails with a local-file error instead of attempting a URL call.
 
-Option B: Download manually and place files here:
+## Manual model placement
+
+You can also download manually and place files here:
 
 ```text
 ./checkpoints/turbo.safetensors
 ./checkpoints/raw.safetensors
+./models/Qwen-Qwen3-VL-4B-Instruct/
+./models/Qwen-Qwen-Image/vae/
 ```
 
-The container maps these to:
-
-```text
-/workspace/checkpoints/turbo.safetensors
-/workspace/checkpoints/raw.safetensors
-```
+The Qwen text encoder folder must be a full Hugging Face snapshot that can be loaded by `transformers.from_pretrained(local_path)`, including config, tokenizer files, and model shard files. The Qwen-Image VAE folder must include `vae/config.json` and the VAE weights.
 
 ## Experimental conditioning rebalance
 
@@ -152,6 +186,30 @@ docker compose build --no-cache
 docker compose up
 ```
 
+### Generate still tries to make a URL/model call
+
+Use this build. The app no longer passes `Qwen/Qwen3-VL-4B-Instruct` directly to Krea's pipeline during normal runtime. It resolves the text encoder to this local path instead:
+
+```text
+/workspace/models/Qwen-Qwen3-VL-4B-Instruct
+```
+
+It also patches the official Qwen VAE loader so it uses this local path instead of `Qwen/Qwen-Image`:
+
+```text
+/workspace/models/Qwen-Qwen-Image/vae
+```
+
+If either folder is missing or incomplete and `KREA2_OFFLINE_MODE=1`, the UI raises a local-file error and does not call Hugging Face.
+
+Check status in the UI under **Model Tools > Check local model files**, or from the host:
+
+```bash
+ls -lah ./checkpoints
+ls -lah ./models/Qwen-Qwen3-VL-4B-Instruct
+ls -lah ./models/Qwen-Qwen-Image/vae
+```
+
 ### Python packages download every time `docker compose up` starts
 
 That means the old startup script is still being used. This build installs UI dependencies during `docker compose build` from `requirements-app.txt`, then starts with the already-built virtual environment:
@@ -203,11 +261,15 @@ This build also sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, `CUDA_M
 
 ### Model checkpoint not found
 
-Download from the Model Tools tab or manually place the safetensors files into `./checkpoints`.
+Run the one-time prep service while online, or manually place the safetensors files into `./checkpoints`. In hard-offline runtime, the Model Tools download button is blocked on purpose.
+
+```bash
+docker compose --profile prepare run --rm model-prep
+```
 
 ### First generation is slow
 
-The first run loads the Krea checkpoint and may download/initialize the Qwen text encoder into the Hugging Face cache if it is not already present. Later generations are faster while the model remains cached in VRAM. To avoid text-encoder downloads at runtime, prewarm the cache by running one generation while online, then keep the `hf-cache` Docker volume.
+The first run still loads the Krea checkpoint and initializes the local Qwen text encoder from disk. That is not a network call. Later generations are faster while the model remains cached in VRAM. Use **Warm up current settings** after selecting a resolution if you want to pay the model load/compile cost before a real prompt.
 
 ## Updating Krea-2 official code
 
@@ -220,3 +282,35 @@ docker compose build --no-cache
 ## License and safety
 
 You are responsible for complying with the Krea-2 Community License and Acceptable Use Policy. This project includes only a minimal local prompt guard and is not production moderation.
+
+## Performance notes
+
+Krea-2 is a large model. On a 16 GB GPU, use Turbo first and avoid RAW until the Turbo path is stable.
+
+Recommended speed settings:
+
+- Checkpoint: `Turbo`
+- Resolution: `768x768` for balanced speed, `512x512` for testing
+- Steps: `6-8`
+- CFG: `0.0` for Turbo
+- Images: `1`
+- dtype: `bfloat16`, or try `float16` if your GPU is faster with fp16
+
+The first generation for a resolution can be much slower because PyTorch/Triton compiles CUDA kernels. Later generations with the same model, dtype, and resolution should be faster because the model and compile cache are reused.
+
+Use **Warm up current settings** after selecting a resolution if you want to pay the model load/compile cost before a real prompt.
+
+If first-run latency is more important than repeated-generation speed, set this in `.env`:
+
+```env
+KREA2_DISABLE_TORCH_COMPILE=1
+```
+
+Then rebuild/restart:
+
+```bash
+docker compose down
+docker compose up --build
+```
+
+For Turbo, avoid raising CFG above `0.0`. CFG greater than zero runs an unconditional branch and roughly doubles the denoising model work.

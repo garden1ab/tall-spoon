@@ -39,8 +39,9 @@ print("Krea-2 local UI app dependencies installed at build time.")
 PYVERIFY
 
 COPY app/ /workspace/app/
+COPY scripts/ /workspace/scripts/
 COPY scripts/start.sh /workspace/start.sh
-RUN chmod +x /workspace/start.sh
+RUN chmod +x /workspace/start.sh /workspace/scripts/*.sh
 
 EXPOSE 7860
 WORKDIR /workspace

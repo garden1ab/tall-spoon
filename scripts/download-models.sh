@@ -1,15 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-mkdir -p checkpoints
+echo "Preparing Krea-2 offline assets with the online prep service."
+echo "Default downloads: Qwen text encoder + Qwen-Image VAE + Krea-2 Turbo checkpoint."
+echo "Set KREA2_PREP_RAW=1 in .env if you also want RAW."
 
-echo "This helper uses huggingface-cli from the Docker container. Prefer the UI Model Tools tab if you want a simpler flow."
-echo "Make sure you accepted the Krea-2 license on Hugging Face."
-
-docker compose run --rm krea2-ui bash -lc '
-  uv run --with huggingface_hub python - <<PY
-from app.download_models import download_checkpoint
-print("Turbo:", download_checkpoint("turbo"))
-print("RAW:", download_checkpoint("raw"))
-PY
-'
+docker compose --profile prepare run --rm model-prep

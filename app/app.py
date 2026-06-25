@@ -11,9 +11,27 @@ from typing import Any
 
 from PIL import Image
 
+# Krea-2 uses torch.compile in parts of the model. That usually improves repeated
+# generations, but the first generation may spend a long time compiling kernels.
+# Set KREA2_DISABLE_TORCH_COMPILE=1 in .env when you want faster first-run latency
+# at the expense of slower sustained throughput. This must happen before importing
+# the official Krea-2 modules.
+if os.getenv("KREA2_DISABLE_TORCH_COMPILE", "0") == "1":
+    os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+
 import gradio as gr
 import psutil
 import torch
+
+DISABLE_TORCH_COMPILE = os.getenv("KREA2_DISABLE_TORCH_COMPILE", "0") == "1"
+if DISABLE_TORCH_COMPILE:
+    def _no_torch_compile(fn=None, *args, **kwargs):
+        if callable(fn):
+            return fn
+        def _decorator(inner):
+            return inner
+        return _decorator
+    torch.compile = _no_torch_compile  # type: ignore[assignment]
 
 # Official Krea-2 repo mounted/cloned in the Docker image.
 KREA_REPO = Path(os.getenv("KREA_REPO", "/workspace/krea-2"))
@@ -28,11 +46,27 @@ from safety import check_prompt  # noqa: E402
 
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "/workspace/outputs"))
 CHECKPOINT_DIR = Path(os.getenv("CHECKPOINT_DIR", "/workspace/checkpoints"))
+MODEL_DIR = Path(os.getenv("MODEL_DIR", "/workspace/models"))
+TEXT_ENCODER_REPO = os.getenv("KREA2_TEXT_ENCODER_REPO", "Qwen/Qwen3-VL-4B-Instruct")
+TEXT_ENCODER_PATH = Path(os.getenv("KREA2_TEXT_ENCODER_PATH", str(MODEL_DIR / "Qwen-Qwen3-VL-4B-Instruct")))
+VAE_REPO = os.getenv("KREA2_VAE_REPO", "Qwen/Qwen-Image")
+VAE_PATH = Path(os.getenv("KREA2_VAE_PATH", str(MODEL_DIR / "Qwen-Qwen-Image")))
+OFFLINE_MODE = os.getenv("KREA2_OFFLINE_MODE", "1") == "1"
 DEVICE = os.getenv("KREA2_DEVICE", "cuda")
 DEFAULT_DTYPE = os.getenv("KREA2_DTYPE", "bfloat16")
 
+# Hard-offline runtime mode. This prevents Transformers/Hugging Face from trying
+# network fallback when Generate is clicked. Missing model files should fail fast
+# with a local-file error instead of opening a URL.
+if OFFLINE_MODE:
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 _PIPELINE_CACHE: dict[tuple[str, str, str], tuple[Any, Any, Any]] = {}
 MAX_CACHED_PIPELINES = int(os.getenv("KREA2_MAX_CACHED_PIPELINES", "1"))
@@ -66,6 +100,79 @@ def _dtype_from_name(name: str):
     if name == "float32":
         return torch.float32
     return torch.bfloat16
+
+
+def _looks_like_hf_snapshot(path: Path) -> bool:
+    """Return True when a local directory appears usable by Transformers.from_pretrained."""
+    if not path.exists() or not path.is_dir():
+        return False
+    required_any = ["config.json", "model.safetensors.index.json", "pytorch_model.bin.index.json"]
+    tokenizer_any = ["tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt"]
+    has_model_config = any((path / item).exists() for item in required_any)
+    has_tokenizer = any((path / item).exists() for item in tokenizer_any)
+    return has_model_config and has_tokenizer
+
+
+def _looks_like_vae_snapshot(path: Path) -> bool:
+    """Return True when the local Qwen-Image VAE subfolder is present."""
+    return path.exists() and path.is_dir() and (path / "vae" / "config.json").exists()
+
+
+def _resolve_vae_path() -> str:
+    path = Path(os.path.expanduser(str(VAE_PATH))).resolve()
+    if _looks_like_vae_snapshot(path):
+        return str(path)
+    if OFFLINE_MODE:
+        raise gr.Error(
+            "Qwen-Image VAE is not available locally. Runtime is hard-offline, so Generate will not download it.\n\n"
+            f"Expected local VAE snapshot at: {path}\n\n"
+            "Run the one-time online prep command while internet is available:\n"
+            "docker compose --profile prepare run --rm model-prep\n\n"
+            "Then restart with docker compose up."
+        )
+    return VAE_REPO
+
+
+class LocalQwenAutoencoder(torch.nn.Module):
+    """Krea-2 autoencoder loader patched to use a local Qwen-Image VAE snapshot."""
+
+    def __init__(self):
+        super().__init__()
+        from diffusers import AutoencoderKLQwenImage
+
+        vae_source = _resolve_vae_path()
+        kwargs = {"subfolder": "vae"}
+        if OFFLINE_MODE:
+            kwargs["local_files_only"] = True
+        self.ae = AutoencoderKLQwenImage.from_pretrained(vae_source, **kwargs)
+        self.compression = 8
+        self.channels = 16
+        self.register_buffer("latents_mean", torch.tensor(self.ae.config.latents_mean).view(1, -1, 1, 1, 1))
+        self.register_buffer("latents_std", torch.tensor(self.ae.config.latents_std).view(1, -1, 1, 1, 1))
+
+    def decode(self, x: torch.Tensor) -> torch.Tensor:
+        x = rearrange(x, "b c h w -> b c 1 h w")
+        x = (x * self.latents_std) + self.latents_mean
+        return rearrange(self.ae.decode(x).sample, "b c 1 h w -> b c h w")
+
+
+def _resolve_text_encoder_path() -> str:
+    """Resolve the Qwen text encoder to a local directory in offline mode."""
+    path = Path(os.path.expanduser(str(TEXT_ENCODER_PATH))).resolve()
+    if _looks_like_hf_snapshot(path):
+        return str(path)
+
+    if OFFLINE_MODE:
+        raise gr.Error(
+            "Krea-2 text encoder is not available locally. Runtime is hard-offline, so Generate will not download it.\n\n"
+            f"Expected local text encoder snapshot at: {path}\n\n"
+            "Run the one-time online prep command while internet is available:\n"
+            "docker compose --profile prepare run --rm model-prep\n\n"
+            "Then restart with docker compose up."
+        )
+
+    # Dev/online fallback only. Normal packaged use should keep OFFLINE_MODE=1.
+    return TEXT_ENCODER_REPO
 
 
 def _resolve_checkpoint_path(checkpoint: str, raw_path: str | None, turbo_path: str | None) -> str:
@@ -105,7 +212,27 @@ def _get_pipeline(checkpoint: str, dtype_name: str, raw_path: str | None, turbo_
         torch.cuda.empty_cache()
 
     dtype = _dtype_from_name(dtype_name)
-    pipe = krea_inference._pipeline(checkpoint=checkpoint, device=DEVICE, dtype=dtype)
+    # Patch the official pipeline's QwenAutoencoder symbol before it builds the VAE.
+    # The upstream file loads AutoencoderKLQwenImage.from_pretrained("Qwen/Qwen-Image", subfolder="vae").
+    # This replacement points it at the local snapshot in offline runtime.
+    krea_inference.QwenAutoencoder = LocalQwenAutoencoder
+    text_encoder_model_id = _resolve_text_encoder_path()
+    base_text_cfg = getattr(krea_inference, "qwen3_vl_4b", None)
+    text_encoder_config = krea_inference.TextEncoderConfig(
+        model_id=text_encoder_model_id,
+        max_length=getattr(base_text_cfg, "max_length", 512),
+        select_layers=getattr(
+            base_text_cfg,
+            "select_layers",
+            (2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35),
+        ),
+    )
+    pipe = krea_inference._pipeline(
+        checkpoint=checkpoint,
+        device=DEVICE,
+        dtype=dtype,
+        text_encoder_config=text_encoder_config,
+    )
     _PIPELINE_CACHE[key] = pipe
     return pipe
 
@@ -130,6 +257,9 @@ def _metadata(**kwargs) -> dict[str, Any]:
         data["gpu"] = torch.cuda.get_device_name(0)
     return data
 
+
+def _seconds(value: float) -> str:
+    return f"{value:.1f}s" if value < 120 else f"{value / 60:.1f}m"
 
 
 
@@ -318,7 +448,12 @@ def generate(
     if checkpoint == "oss_turbo" and cfg != 0:
         gr.Warning("Turbo is designed for CFG 0.0. This will still run, but the recommended setting is 0.0.")
 
-    yield [], None, "Loading model. First load can take several minutes because the checkpoint and Qwen text encoder are initialized."
+    total_start = time.perf_counter()
+    load_start = time.perf_counter()
+    yield [], None, (
+        "Loading model. The first run can be slow because Krea-2 initializes the checkpoint, "
+        "Qwen text encoder, and optionally Torch/Triton compiled kernels."
+    )
 
     try:
         dit, ae, encoder = _get_pipeline(checkpoint, dtype_name, raw_path or None, turbo_path or None)
@@ -329,7 +464,12 @@ def generate(
             "Then restart the container if VRAM is still reserved."
         ) from exc
 
-    yield [], None, "Generating images."
+    load_elapsed = time.perf_counter() - load_start
+    gen_start = time.perf_counter()
+    yield [], None, (
+        f"Model ready in {_seconds(load_elapsed)}. Generating images. "
+        "If this is the first generation for this resolution, Torch/Triton may still compile kernels."
+    )
 
     parsed_layer_weights = None
     if cond_rebalance_enabled:
@@ -389,6 +529,9 @@ def generate(
             "and avoid RAW on a 16 GB card unless you add offload/quantization support."
         ) from exc
 
+    gen_elapsed = time.perf_counter() - gen_start
+    save_start = time.perf_counter()
+
     run_id = time.strftime("%Y%m%d-%H%M%S") + f"-{checkpoint}-{seed}"
     run_dir = OUTPUT_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -422,8 +565,17 @@ def generate(
     (run_dir / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     zip_path = _zip_paths(saved, run_dir)
 
+    save_elapsed = time.perf_counter() - save_start
+    total_elapsed = time.perf_counter() - total_start
+    per_image = gen_elapsed / max(1, len(saved))
+
     gallery = [(str(p), f"seed {seed + i}") for i, p in enumerate(saved)]
-    yield gallery, str(zip_path), f"Saved {len(saved)} image(s) to {run_dir}"
+    yield gallery, str(zip_path), (
+        f"Saved {len(saved)} image(s) to {run_dir}\n"
+        f"Timing: load/cache {_seconds(load_elapsed)} | generate {_seconds(gen_elapsed)} "
+        f"({_seconds(per_image)} per image) | save {_seconds(save_elapsed)} | total {_seconds(total_elapsed)}\n"
+        f"Torch compile disabled: {DISABLE_TORCH_COMPILE}"
+    )
 
 
 def model_preset(checkpoint: str):
@@ -435,6 +587,63 @@ def model_preset(checkpoint: str):
 def safe_16gb_preset():
     """Conservative settings for 16 GB GPUs / WSL2."""
     return "oss_turbo", 768, 768, 8, 0.0, 0.5, 1.15, 1.15, True, 1, "bfloat16"
+
+
+def speed_preset(mode: str):
+    """Latency-oriented Turbo presets. All keep CFG at 0 to avoid double forward passes."""
+    presets = {
+        "Ultra-fast test - 512 / 4 steps": ("oss_turbo", 512, 512, 4, 0.0, 0.5, 1.15, 1.15, True, 1, "bfloat16"),
+        "Fast draft - 640 / 6 steps": ("oss_turbo", 640, 640, 6, 0.0, 0.5, 1.15, 1.15, True, 1, "bfloat16"),
+        "16 GB balanced - 768 / 8 steps": ("oss_turbo", 768, 768, 8, 0.0, 0.5, 1.15, 1.15, True, 1, "bfloat16"),
+        "Quality Turbo - 1024 / 8 steps": ("oss_turbo", 1024, 1024, 8, 0.0, 0.5, 1.15, 1.15, True, 1, "bfloat16"),
+        "Try float16 draft - 768 / 8 steps": ("oss_turbo", 768, 768, 8, 0.0, 0.5, 1.15, 1.15, True, 1, "float16"),
+    }
+    return presets.get(mode, presets["16 GB balanced - 768 / 8 steps"])
+
+
+def warmup_current_settings(
+    checkpoint: str,
+    width: int,
+    height: int,
+    cfg: float,
+    y1: float,
+    y2: float,
+    mu: float | None,
+    use_mu: bool,
+    dtype_name: str,
+    raw_path: str,
+    turbo_path: str,
+) -> str:
+    """Compile/load warmup for the selected model/resolution without saving an image."""
+    t0 = time.perf_counter()
+    try:
+        dit, ae, encoder = _get_pipeline(checkpoint, dtype_name, raw_path or None, turbo_path or None)
+        with torch.inference_mode():
+            images = sample(
+                dit,
+                ae,
+                encoder,
+                ["warmup image, simple neutral subject"],
+                width=int(width),
+                height=int(height),
+                steps=1,
+                guidance=float(cfg),
+                seed=123456,
+                y1=float(y1),
+                y2=float(y2),
+                mu=float(mu) if use_mu and mu is not None else None,
+            )
+        del images
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return (
+            f"Warmup completed in {_seconds(time.perf_counter() - t0)} for {checkpoint} at {width}x{height}. "
+            "Run generation again with the same resolution/settings to reuse the loaded model and compiled kernels."
+        )
+    except torch.cuda.OutOfMemoryError as exc:
+        _clear_pipeline_cache()
+        raise gr.Error("CUDA out of memory during warmup. Try the ultra-fast 512 preset first.") from exc
 
 
 def unload_models() -> str:
@@ -459,8 +668,17 @@ def system_info() -> str:
         lines.append("CUDA: unavailable")
     lines.append(f"Krea repo: {KREA_REPO}")
     lines.append(f"Checkpoint dir: {CHECKPOINT_DIR}")
+    lines.append(f"Model dir: {MODEL_DIR}")
+    lines.append(f"Text encoder path: {TEXT_ENCODER_PATH}")
+    lines.append(f"VAE path: {VAE_PATH}")
+    lines.append(f"Hard-offline runtime: {OFFLINE_MODE}")
+    lines.append(f"HF_HUB_OFFLINE: {os.getenv('HF_HUB_OFFLINE', '')}")
+    lines.append(f"TRANSFORMERS_OFFLINE: {os.getenv('TRANSFORMERS_OFFLINE', '')}")
     lines.append(f"Output dir: {OUTPUT_DIR}")
     lines.append(f"Cached pipelines: {len(_PIPELINE_CACHE)}")
+    lines.append(f"Torch compile disabled: {DISABLE_TORCH_COMPILE}")
+    lines.append(f"TorchInductor cache: {os.getenv('TORCHINDUCTOR_CACHE_DIR', 'default')}")
+    lines.append(f"Triton cache: {os.getenv('TRITON_CACHE_DIR', 'default')}")
     return "\n".join(lines)
 
 
@@ -471,7 +689,46 @@ def history():
     return items
 
 
+def local_model_status() -> str:
+    turbo = Path(os.getenv("OSS_TURBO", str(CHECKPOINT_DIR / "turbo.safetensors")))
+    raw = Path(os.getenv("OSS_RAW", str(CHECKPOINT_DIR / "raw.safetensors")))
+    text_path = Path(os.path.expanduser(str(TEXT_ENCODER_PATH))).resolve()
+    vae_path = Path(os.path.expanduser(str(VAE_PATH))).resolve()
+
+    def fmt_file(path: Path) -> str:
+        if path.exists():
+            return f"FOUND - {path} ({path.stat().st_size / (1024**3):.2f} GB)"
+        return f"MISSING - {path}"
+
+    lines = [
+        f"Hard-offline runtime: {OFFLINE_MODE}",
+        f"HF_HUB_OFFLINE: {os.getenv('HF_HUB_OFFLINE', '')}",
+        f"TRANSFORMERS_OFFLINE: {os.getenv('TRANSFORMERS_OFFLINE', '')}",
+        f"Text encoder repo: {TEXT_ENCODER_REPO}",
+        f"Text encoder local path: {text_path}",
+        f"Text encoder snapshot: {'FOUND' if _looks_like_hf_snapshot(text_path) else 'MISSING/INCOMPLETE'}",
+        f"VAE repo: {VAE_REPO}",
+        f"VAE local path: {vae_path}",
+        f"VAE snapshot: {'FOUND' if _looks_like_vae_snapshot(vae_path) else 'MISSING/INCOMPLETE'}",
+        f"Turbo checkpoint: {fmt_file(turbo)}",
+        f"RAW checkpoint: {fmt_file(raw)}",
+        "",
+        "If anything is missing, run while online:",
+        "docker compose --profile prepare run --rm model-prep",
+        "",
+        "Then use normal offline runtime:",
+        "docker compose up",
+    ]
+    return "\n".join(lines)
+
+
 def download_selected(which: str, token: str):
+    if OFFLINE_MODE:
+        raise gr.Error(
+            "Runtime is hard-offline, so the UI will not download models during Generate or from this tab.\n\n"
+            "Use the one-time online prep service instead:\n"
+            "docker compose --profile prepare run --rm model-prep"
+        )
     key = "turbo" if "Turbo" in which else "raw"
     path = download_checkpoint(key, token.strip() or None)
     if key == "turbo":
@@ -502,6 +759,19 @@ with gr.Blocks(title="Krea-2 Local UI", css=CSS) as demo:
                 )
                 preset_btn = gr.Button("Apply recommended preset")
                 safe_16gb_btn = gr.Button("Apply 16 GB safe preset")
+                with gr.Row():
+                    speed_mode = gr.Dropdown(
+                        choices=[
+                            "Ultra-fast test - 512 / 4 steps",
+                            "Fast draft - 640 / 6 steps",
+                            "16 GB balanced - 768 / 8 steps",
+                            "Quality Turbo - 1024 / 8 steps",
+                            "Try float16 draft - 768 / 8 steps",
+                        ],
+                        value="16 GB balanced - 768 / 8 steps",
+                        label="Speed preset",
+                    )
+                    speed_btn = gr.Button("Apply speed preset")
                 with gr.Row():
                     width = gr.Slider(512, 2048, value=1024, step=16, label="Width")
                     height = gr.Slider(512, 2048, value=1024, step=16, label="Height")
@@ -557,7 +827,9 @@ with gr.Blocks(title="Krea-2 Local UI", css=CSS) as demo:
                 with gr.Accordion("Manual checkpoint paths", open=False):
                     turbo_path = gr.Textbox(value=os.getenv("OSS_TURBO", str(CHECKPOINT_DIR / "turbo.safetensors")), label="Turbo safetensors path")
                     raw_path = gr.Textbox(value=os.getenv("OSS_RAW", str(CHECKPOINT_DIR / "raw.safetensors")), label="RAW safetensors path")
-                generate_btn = gr.Button("Generate", variant="primary")
+                with gr.Row():
+                    generate_btn = gr.Button("Generate", variant="primary")
+                    warmup_btn = gr.Button("Warm up current settings")
             with gr.Column(scale=2):
                 gallery = gr.Gallery(label="Output", columns=2, height=720)
                 zip_file = gr.File(label="Download run ZIP")
@@ -571,6 +843,11 @@ with gr.Blocks(title="Krea-2 Local UI", css=CSS) as demo:
         safe_16gb_btn.click(
             safe_16gb_preset,
             inputs=[],
+            outputs=[checkpoint, width, height, steps, cfg, y1, y2, mu, use_mu, num_images, dtype_name],
+        )
+        speed_btn.click(
+            speed_preset,
+            inputs=[speed_mode],
             outputs=[checkpoint, width, height, steps, cfg, y1, y2, mu, use_mu, num_images, dtype_name],
         )
         cond_layer_sliders = [
@@ -592,14 +869,30 @@ with gr.Blocks(title="Krea-2 Local UI", css=CSS) as demo:
             ],
             outputs=[gallery, zip_file, status],
         )
+        warmup_btn.click(
+            warmup_current_settings,
+            inputs=[checkpoint, width, height, cfg, y1, y2, mu, use_mu, dtype_name, raw_path, turbo_path],
+            outputs=[status],
+        )
 
     with gr.Tab("Model Tools"):
         gr.Markdown(
-            "Download Krea-2 checkpoints into `./checkpoints`. You may need to accept the model license on Hugging Face and provide `HF_TOKEN`."
+            "Runtime is hard-offline by default. Generate will only use local files. "
+            "Prepare/download models once with `docker compose --profile prepare run --rm model-prep`, "
+            "or manually place files into `./checkpoints` and `./models`."
+        )
+        status_btn = gr.Button("Check local model files")
+        model_status = gr.Textbox(label="Local model status", lines=12, elem_id="status_box")
+        status_btn.click(local_model_status, outputs=[model_status])
+        demo.load(local_model_status, outputs=[model_status])
+
+        gr.Markdown(
+            "Optional online/dev download. This is intentionally blocked when `KREA2_OFFLINE_MODE=1`. "
+            "Use the prepare service for normal local/offline setup."
         )
         which = gr.Radio(["Turbo", "RAW"], value="Turbo", label="Checkpoint to download")
         token = gr.Textbox(label="HF token", type="password", placeholder="Optional if already authenticated / public access works")
-        dl_btn = gr.Button("Download selected checkpoint")
+        dl_btn = gr.Button("Download selected checkpoint - online/dev mode only")
         dl_status = gr.Textbox(label="Download status", lines=3)
         dl_path = gr.Textbox(label="Downloaded path")
         dl_btn.click(download_selected, inputs=[which, token], outputs=[dl_status, dl_path])
